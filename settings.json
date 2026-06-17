@@ -16,7 +16,7 @@
   "subagents": {
     "autoRun": false
   },
-  "theme": "dark",
+  "theme": "ristretto",
   "terminal": {
     "showTerminalProgress": true
   },

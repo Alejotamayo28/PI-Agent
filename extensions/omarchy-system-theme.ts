@@ -12,30 +12,30 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const home = process.env.HOME ?? "";
 const lightModePath = join(home, ".config/omarchy/current/theme/light.mode");
 
-function omarchyPiTheme(): "light" | "dark" {
-	return existsSync(lightModePath) ? "light" : "dark";
+function omarchyPiTheme(): "light" | "ristretto" {
+  return existsSync(lightModePath) ? "light" : "ristretto";
 }
 
-export default function (pi: ExtensionAPI) {
-	let intervalId: ReturnType<typeof setInterval> | null = null;
+export default function(pi: ExtensionAPI) {
+  let intervalId: ReturnType<typeof setInterval> | null = null;
 
-	pi.on("session_start", (_event, ctx) => {
-		let currentTheme = omarchyPiTheme();
-		ctx.ui.setTheme(currentTheme);
+  pi.on("session_start", (_event, ctx) => {
+    let currentTheme = omarchyPiTheme();
+    ctx.ui.setTheme(currentTheme);
 
-		intervalId = setInterval(() => {
-			const nextTheme = omarchyPiTheme();
-			if (nextTheme !== currentTheme) {
-				currentTheme = nextTheme;
-				ctx.ui.setTheme(currentTheme);
-			}
-		}, 2000);
-	});
+    intervalId = setInterval(() => {
+      const nextTheme = omarchyPiTheme();
+      if (nextTheme !== currentTheme) {
+        currentTheme = nextTheme;
+        ctx.ui.setTheme(currentTheme);
+      }
+    }, 2000);
+  });
 
-	pi.on("session_shutdown", () => {
-		if (intervalId) {
-			clearInterval(intervalId);
-			intervalId = null;
-		}
-	});
+  pi.on("session_shutdown", () => {
+    if (intervalId) {
+      clearInterval(intervalId);
+      intervalId = null;
+    }
+  });
 }
