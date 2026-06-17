@@ -1,0 +1,52 @@
+# Secrets and credentials
+# Do not commit auth tokens, API keys, or local credential files.
+auth.json
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+*_key
+*_secret
+*token*
+*credential*
+
+# Pi agent private/local state
+# Session logs can contain prompts, source code, secrets, and personal data.
+sessions/
+run-history.jsonl
+trust.json
+
+# Local git/cache mirrors managed by pi
+git/
+
+# Dependencies / generated package artifacts
+node_modules/
+npm/
+.pnpm-store/
+.yarn/
+
+# Nested repositories / VCS internals
+**/.git/
+
+# Build/cache/temp output
+.cache/
+cache/
+dist/
+build/
+out/
+coverage/
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

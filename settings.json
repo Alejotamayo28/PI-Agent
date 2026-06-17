@@ -1,0 +1,24 @@
+{
+  "lastChangelogVersion": "0.79.1",
+  "packages": [
+    "git:github.com/xRyul/pi-nvidia-nim",
+    "npm:@plannotator/pi-extension",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:pi-web-access"
+  ],
+  "extensions": [
+    "./extensions/skill-model-router.ts"
+  ],
+  "defaultProvider": "openai-codex",
+  "defaultModel": "gpt-5.5",
+  "hideThinkingBlock": false,
+  "defaultThinkingLevel": "high",
+  "subagents": {
+    "autoRun": false
+  },
+  "theme": "dark",
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "treeFilterMode": "default"
+}
