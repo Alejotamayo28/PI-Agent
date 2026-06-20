@@ -26,6 +26,7 @@ interface ChatHistoryItem {
 interface RenderedLine {
   itemIndex: number;
   text: string;
+  kind: "separator" | "title" | "body";
 }
 
 interface TextRange {
@@ -35,6 +36,7 @@ interface TextRange {
 
 type ModeChangeHandler = (mode: VimChatMode) => void;
 type OpenChatNavigator = () => void;
+type IsIdleHandler = () => boolean;
 type YankHandler = (text: string) => void | Promise<void>;
 
 const MAX_BODY_CHARS = 8_000;
@@ -58,20 +60,103 @@ function truncateBody(text: string): string {
   return `${text.slice(0, MAX_BODY_CHARS)}\n… [truncated for chat navigator]`;
 }
 
-function contentToText(content: unknown): string {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function truncateInline(text: string, maxChars = 160): string {
+  const cleaned = cleanText(text).replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function stringArgument(args: Record<string, unknown>, key: string): string {
+  const value = args[key];
+  return typeof value === "string" ? cleanText(value).trim() : "";
+}
+
+function numberArgument(args: Record<string, unknown>, key: string): number | undefined {
+  const value = args[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatPathWithRange(path: string, args: Record<string, unknown>): string {
+  const offset = numberArgument(args, "offset");
+  const limit = numberArgument(args, "limit");
+  if (offset !== undefined && limit !== undefined) return `${path}:${offset}-${offset + limit - 1}`;
+  if (offset !== undefined) return `${path}:${offset}`;
+  if (limit !== undefined) return `${path}:1-${limit}`;
+  return path;
+}
+
+function compactJson(value: unknown): string {
+  try {
+    return truncateInline(JSON.stringify(value));
+  } catch {
+    return truncateInline(String(value));
+  }
+}
+
+function formatThinkingBlock(block: Record<string, unknown>): string {
+  return cleanText(block.thinking);
+}
+
+function formatToolCallBlock(block: Record<string, unknown>): string {
+  const name = typeof block.name === "string" && block.name.trim() ? block.name.trim() : "toolCall";
+  const args = isRecord(block.arguments) ? block.arguments : undefined;
+  if (!args) return name;
+
+  const path = stringArgument(args, "path");
+  const pattern = stringArgument(args, "pattern");
+  const query = stringArgument(args, "query");
+  const command = stringArgument(args, "command");
+
+  switch (name) {
+    case "read":
+      return path ? `read ${formatPathWithRange(path, args)}` : "read";
+    case "write":
+      return path ? `write ${path}` : "write";
+    case "edit":
+      return path ? `edit ${path}` : "edit";
+    case "bash":
+      return command ? `bash ${truncateInline(command.split("\n")[0] ?? "")}` : "bash";
+    case "grep":
+      return truncateInline(["grep", pattern, path].filter(Boolean).join(" ")) || "grep";
+    case "find":
+      return truncateInline(["find", pattern || query, path].filter(Boolean).join(" ")) || "find";
+    case "ls":
+      return path ? `ls ${path}` : "ls";
+    case "web_search":
+      return query ? `web_search ${truncateInline(query)}` : "web_search";
+    case "fetch_content": {
+      const url = stringArgument(args, "url");
+      return url ? `fetch_content ${truncateInline(url)}` : "fetch_content";
+    }
+    default:
+      return `${name} ${compactJson(args)}`.trim();
+  }
+}
+
+function contentToDisplayText(content: unknown): string {
   if (typeof content === "string") return cleanText(content);
   if (!Array.isArray(content)) return cleanText(content);
 
   const parts = content.map((block) => {
-    if (!block || typeof block !== "object") return "";
-    const typed = block as Record<string, any>;
+    if (!isRecord(block)) return "";
 
-    // The CHAT NAV overlay is intentionally text-only for the current session.
-    // Skip tool calls, thinking blocks, images, and other metadata-like blocks.
-    return typed.type === "text" ? cleanText(typed.text) : "";
+    switch (block.type) {
+      case "text":
+        return cleanText(block.text);
+      case "thinking":
+        return formatThinkingBlock(block);
+      case "toolCall":
+        return formatToolCallBlock(block);
+      default:
+        return "";
+    }
   });
 
-  return cleanText(parts.filter(Boolean).join("\n"));
+  return cleanText(parts.filter(Boolean).join("\n\n"));
 }
 
 function formatTimestamp(message: Record<string, any>, entry: Record<string, any>): string {
@@ -92,17 +177,20 @@ function formatUserMessage(message: Record<string, any>, entry: Record<string, a
     id: entry.id ?? `user-${entry.timestamp ?? Math.random()}`,
     role: "user",
     title: titleWithTime("USER", formatTimestamp(message, entry)),
-    body: truncateBody(contentToText(message.content) || "[empty user message]"),
+    body: truncateBody(contentToDisplayText(message.content) || "[empty user message]"),
   };
 }
 
-function formatAssistantMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+function formatAssistantMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem | undefined {
+  const body = contentToDisplayText(message.content);
+  if (!body.trim()) return undefined;
+
   const model = message.model ? ` · ${message.model}` : "";
   return {
     id: entry.id ?? `assistant-${entry.timestamp ?? Math.random()}`,
     role: "assistant",
     title: titleWithTime(`ASSISTANT${model}`, formatTimestamp(message, entry)),
-    body: truncateBody(contentToText(message.content) || "[empty assistant message]"),
+    body: truncateBody(body),
   };
 }
 
@@ -310,6 +398,12 @@ class ChatHistoryNavigator {
           continue;
         }
 
+        if (line.kind === "separator") {
+          const separator = this.theme.fg("borderMuted", "─".repeat(Math.max(0, safeWidth - 2)));
+          lines.push(this.padLine(separator, safeWidth));
+          continue;
+        }
+
         const marker = globalIndex === this.selectedLine ? "▶ " : "  ";
         const renderedText = this.renderHistoryLine(globalIndex, line.text);
         const text = truncateToWidth(`${marker}${renderedText}`, safeWidth - 2, "…");
@@ -473,20 +567,21 @@ class ChatHistoryNavigator {
 
     const lines: RenderedLine[] = [];
     this.items.forEach((item, itemIndex) => {
-      if (lines.length > 0) lines.push({ itemIndex, text: "" });
+      lines.push({ itemIndex, text: "", kind: "separator" });
       lines.push({
         itemIndex,
         text: this.formatTitle(item),
+        kind: "title",
       });
 
       const bodyWidth = Math.max(1, width - 2);
       for (const bodyLine of wrapPlainText(item.body, bodyWidth)) {
-        lines.push({ itemIndex, text: `  ${bodyLine}` });
+        lines.push({ itemIndex, text: `  ${bodyLine}`, kind: "body" });
       }
     });
 
     this.cachedWidth = width;
-    this.cachedLines = lines.length > 0 ? lines : [{ itemIndex: 0, text: "No text chat history yet." }];
+    this.cachedLines = lines.length > 0 ? lines : [{ itemIndex: 0, text: "No text chat history yet.", kind: "body" }];
     return this.cachedLines;
   }
 
@@ -505,7 +600,7 @@ class ChatHistoryNavigator {
       case "visualChar":
         return "VISUAL";
       default:
-        return "NORMAL";
+        return "NAVIGATION";
     }
   }
 
@@ -520,7 +615,7 @@ class ChatHistoryNavigator {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const currentItem = lines[this.selectedLine]?.itemIndex ?? 0;
     const targetItem = Math.max(0, Math.min(this.items.length - 1, currentItem + delta));
-    const targetLine = lines.findIndex((line) => line.itemIndex === targetItem);
+    const targetLine = this.findItemTitleLine(lines, targetItem);
     if (targetLine >= 0) {
       this.selectedLine = targetLine;
       this.cursorLine = this.selectedLine;
@@ -539,7 +634,7 @@ class ChatHistoryNavigator {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const currentItem = lines[this.selectedLine]?.itemIndex ?? 0;
     const targetItem = Math.max(0, Math.min(this.items.length - 1, currentItem + delta));
-    const targetLine = lines.findIndex((line) => line.itemIndex === targetItem);
+    const targetLine = this.findItemTitleLine(lines, targetItem);
     if (targetLine >= 0) {
       this.selectedLine = targetLine;
       this.cursorLine = this.selectedLine;
@@ -655,6 +750,11 @@ class ChatHistoryNavigator {
     this.scrollTop = Math.max(0, Math.min(Math.max(totalLines - visibleCount, 0), this.scrollTop));
   }
 
+  private findItemTitleLine(lines: RenderedLine[], itemIndex: number): number {
+    const titleLine = lines.findIndex((line) => line.itemIndex === itemIndex && line.kind === "title");
+    return titleLine >= 0 ? titleLine : lines.findIndex((line) => line.itemIndex === itemIndex);
+  }
+
   private maxColumnForLine(lineIndex: number): number {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const text = lines[lineIndex]?.text ?? "";
@@ -694,6 +794,7 @@ class VimChatNavigationEditor extends CustomEditor {
     theme: any,
     keybindings: any,
     private readonly openChatNavigator: OpenChatNavigator,
+    private readonly isIdle: IsIdleHandler,
     private readonly onModeChange?: ModeChangeHandler,
   ) {
     super(tui, theme, keybindings);
@@ -701,6 +802,11 @@ class VimChatNavigationEditor extends CustomEditor {
 
   override handleInput(data: string): void {
     if (matchesKey(data, "escape")) {
+      if (!this.isIdle()) {
+        super.handleInput(data);
+        return;
+      }
+
       this.setMode("chat");
       this.openChatNavigator();
       return;
@@ -708,20 +814,6 @@ class VimChatNavigationEditor extends CustomEditor {
 
     // Preserve Pi's default editor behavior in prompt mode, including Enter submit.
     super.handleInput(data);
-  }
-
-  override render(width: number): string[] {
-    const lines = super.render(width);
-    if (lines.length === 0) return lines;
-
-    const label = this.mode === "insert" ? " INSERT " : " CHAT NAV ";
-    const last = lines.length - 1;
-
-    if (visibleWidth(lines[last]!) >= label.length) {
-      lines[last] = truncateToWidth(lines[last]!, width - label.length, "") + label;
-    }
-
-    return lines;
   }
 
   setExternalMode(mode: VimChatMode): void {
@@ -755,7 +847,7 @@ export default function(pi: ExtensionAPI) {
     const setModeStatus = (mode: VimChatMode) => {
       const label = mode === "insert"
         ? ctx.ui.theme.fg("accent", "mode: INSERT")
-        : ctx.ui.theme.fg("warning", "mode: NORMAL");
+        : ctx.ui.theme.fg("warning", "mode: NAVIGATION");
       ctx.ui.setStatus("vim-chat-navigation", label);
     };
 
@@ -809,6 +901,7 @@ export default function(pi: ExtensionAPI) {
         theme,
         keybindings,
         openChatNavigator,
+        () => ctx.isIdle(),
         setModeStatus,
       );
       return editor;
