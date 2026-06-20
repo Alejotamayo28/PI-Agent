@@ -13,12 +13,11 @@ import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 type VimChatMode = "insert" | "chat";
-type MessageRole = "user" | "assistant" | "toolResult" | "bashExecution" | "custom" | "branchSummary" | "compactionSummary" | "entry" | "media";
+type MessageRole = "user" | "assistant" | "toolResult" | "bashExecution" | "custom" | "branchSummary" | "compactionSummary" | "entry";
 type NavigatorMode = "normal" | "visualLine" | "visualChar";
-type RenderedLineKind = "separator" | "title" | "body" | "detail";
+type RenderedLineKind = "separator" | "title" | "body";
 
 interface ChatHistoryItem {
-  id: string;
   role: MessageRole;
   title: string;
   body: string;
@@ -26,7 +25,6 @@ interface ChatHistoryItem {
 }
 
 interface ExtractedContentBlock {
-  kind: "text" | "image";
   text: string;
 }
 
@@ -77,29 +75,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function truncateInline(text: string, maxChars = 160): string {
-  const cleaned = cleanText(text).replace(/\s+/g, " ").trim();
-  if (cleaned.length <= maxChars) return cleaned;
-  return `${cleaned.slice(0, Math.max(0, maxChars - 1))}…`;
-}
-
 function stringArgument(args: Record<string, unknown>, key: string): string {
   const value = args[key];
   return typeof value === "string" ? cleanText(value).trim() : "";
-}
-
-function numberArgument(args: Record<string, unknown>, key: string): number | undefined {
-  const value = args[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function formatPathWithRange(path: string, args: Record<string, unknown>): string {
-  const offset = numberArgument(args, "offset");
-  const limit = numberArgument(args, "limit");
-  if (offset !== undefined && limit !== undefined) return `${path}:${offset}-${offset + limit - 1}`;
-  if (offset !== undefined) return `${path}:${offset}`;
-  if (limit !== undefined) return `${path}:1-${limit}`;
-  return path;
 }
 
 function isPrimitivePlain(value: unknown): boolean {
@@ -145,14 +123,6 @@ function formatPlainValue(value: unknown, indent = 0): string {
 }
 
 
-function compactJson(value: unknown): string {
-  try {
-    return truncateInline(JSON.stringify(value));
-  } catch {
-    return truncateInline(String(value));
-  }
-}
-
 function imagePlaceholder(block: Record<string, unknown>): string {
   const mimeType = typeof block.mimeType === "string" && block.mimeType.trim()
     ? block.mimeType.trim()
@@ -195,12 +165,12 @@ function extractContentBlocks(content: unknown, options: ContentExtractionOption
 
   if (typeof content === "string") {
     const text = cleanText(content);
-    return includeText && text ? [{ kind: "text", text }] : [];
+    return includeText && text ? [{ text }] : [];
   }
 
   if (!Array.isArray(content)) {
     const text = isRecord(content) ? formatPlainValue(content) : cleanText(content);
-    return includeText && text ? [{ kind: "text", text }] : [];
+    return includeText && text ? [{ text }] : [];
   }
 
   const blocks: ExtractedContentBlock[] = [];
@@ -211,22 +181,22 @@ function extractContentBlocks(content: unknown, options: ContentExtractionOption
       case "text": {
         if (!includeText) break;
         const text = cleanText(block.text);
-        if (text) blocks.push({ kind: "text", text });
+        if (text) blocks.push({ text });
         break;
       }
       case "image":
-        if (includeImages) blocks.push({ kind: "image", text: imagePlaceholder(block) });
+        if (includeImages) blocks.push({ text: imagePlaceholder(block) });
         break;
       case "thinking": {
         if (!includeThinking) break;
         const text = cleanText(block.thinking);
-        if (text) blocks.push({ kind: "text", text: `[thinking]\n${text}` });
+        if (text) blocks.push({ text: `[thinking]\n${text}` });
         break;
       }
       case "toolCall": {
         if (!includeToolCalls) break;
         const text = formatToolCallBlock(block);
-        if (text) blocks.push({ kind: "text", text });
+        if (text) blocks.push({ text });
         break;
       }
       default:
@@ -245,11 +215,6 @@ function extractDisplayText(content: unknown, options?: ContentExtractionOptions
   return contentBlocksToText(extractContentBlocks(content, options));
 }
 
-function detailsText(details: unknown): string {
-  if (details === undefined || details === null) return "";
-  return `details:\n${formatPlainValue(details)}`;
-}
-
 function formatTimestamp(message: Record<string, any>, entry: Record<string, any>): string {
   const raw = message.timestamp ?? entry.timestamp;
   if (!raw) return "";
@@ -263,14 +228,9 @@ function titleWithTime(label: string, time: string): string {
   return time ? `${label} ${time}` : label;
 }
 
-function messageEntryId(entry: Record<string, any>, fallbackPrefix: string): string {
-  return entry.id ?? `${fallbackPrefix}-${entry.timestamp ?? Math.random()}`;
-}
-
 function formatUserMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
   const body = extractDisplayText(message.content, { includeImages: true }) || "[empty user message]";
   return {
-    id: messageEntryId(entry, "user"),
     role: "user",
     title: titleWithTime("USER", formatTimestamp(message, entry)),
     body: truncateBody(body),
@@ -289,7 +249,6 @@ function formatAssistantMessage(message: Record<string, any>, entry: Record<stri
 
   const model = message.model ? ` · ${message.model}` : "";
   return {
-    id: messageEntryId(entry, "assistant"),
     role: "assistant",
     title: titleWithTime(`ASSISTANT${model}`, formatTimestamp(message, entry)),
     body: truncateBody(assistantBody),
@@ -305,7 +264,6 @@ function formatToolResultMessage(message: Record<string, any>, entry: Record<str
   const body = extractDisplayText(message.content, { includeImages: true }) || "[empty tool result]";
 
   return {
-    id: messageEntryId(entry, "tool-result"),
     role: "toolResult",
     title: titleWithTime(`TOOL ${toolName} · ${status}`, formatTimestamp(message, entry)),
     body: truncateBody(body),
@@ -320,7 +278,7 @@ function bashStatus(message: Record<string, any>): string {
   return `exit ${exitCode}`;
 }
 
-function formatBashExecutionMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem | undefined {
+function formatBashExecutionMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
   const command = cleanText(message.command).trim();
   const output = cleanText(message.output);
   const statusParts = [bashStatus(message)];
@@ -336,7 +294,6 @@ function formatBashExecutionMessage(message: Record<string, any>, entry: Record<
   }
 
   return {
-    id: messageEntryId(entry, "bash"),
     role: "bashExecution",
     title: titleWithTime(`BASH · ${statusParts.join(" · ")}`, formatTimestamp(message, entry)),
     body: truncateBody(bodyParts.filter(Boolean).join("\n\n")),
@@ -352,7 +309,6 @@ function formatCustomMessage(message: Record<string, any>, entry: Record<string,
   const body = extractDisplayText(message.content, { includeImages: true }) || "[empty custom message]";
 
   return {
-    id: messageEntryId(entry, "custom"),
     role: "custom",
     title: titleWithTime(`CUSTOM · ${customType}${visibility}`, formatTimestamp(message, entry)),
     body: truncateBody(body),
@@ -362,7 +318,6 @@ function formatCustomMessage(message: Record<string, any>, entry: Record<string,
 
 function formatBranchSummaryMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
   return {
-    id: messageEntryId(entry, "branch-summary"),
     role: "branchSummary",
     title: titleWithTime("BRANCH SUMMARY", formatTimestamp(message, entry)),
     body: truncateBody(cleanText(message.summary) || "[empty branch summary]"),
@@ -372,7 +327,6 @@ function formatBranchSummaryMessage(message: Record<string, any>, entry: Record<
 
 function formatCompactionSummaryMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
   return {
-    id: messageEntryId(entry, "compaction-summary"),
     role: "compactionSummary",
     title: titleWithTime("COMPACTION SUMMARY", formatTimestamp(message, entry)),
     body: truncateBody(cleanText(message.summary) || "[empty compaction summary]"),
@@ -389,7 +343,6 @@ function formatUnknownMessage(message: Record<string, any>, entry: Record<string
     includeToolCalls: true,
   }) || cleanText(message.summary) || cleanText(message.output) || "[empty message]";
   return {
-    id: messageEntryId(entry, `message-${role}`),
     role: "entry",
     title: titleWithTime(`MESSAGE · ${role}`, formatTimestamp(message, entry)),
     body: truncateBody(body),
@@ -397,13 +350,9 @@ function formatUnknownMessage(message: Record<string, any>, entry: Record<string
   };
 }
 
-function formatGenericEntry(_entry: Record<string, any>): ChatHistoryItem | undefined {
-  return undefined;
-}
-
 function formatMessageEntry(entry: Record<string, any>): ChatHistoryItem | undefined {
   if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") {
-    return formatGenericEntry(entry);
+    return undefined;
   }
 
   const message = entry.message as Record<string, any>;
@@ -479,12 +428,6 @@ function wrapPlainLine(text: string, width: number): string[] {
 
   if (current.trim()) lines.push(current.trimEnd());
   return lines.length > 0 ? lines : [""];
-}
-
-function wrapPlainText(text: string, width: number): string[] {
-  const rawLines = cleanText(text).split("\n");
-  const wrapped = rawLines.flatMap((line) => wrapPlainLine(line || " ", width));
-  return wrapped.length > 0 ? wrapped : [" "];
 }
 
 function textChars(text: string): string[] {
@@ -882,7 +825,6 @@ class ChatHistoryNavigator {
       branchSummary: "⑂",
       compactionSummary: "⬡",
       entry: "·",
-      media: "▧",
     }[item.role];
     const raw = `${icon} ${item.title}`;
     if (!styled) return raw;
@@ -896,7 +838,6 @@ class ChatHistoryNavigator {
       branchSummary: "muted",
       compactionSummary: "muted",
       entry: "dim",
-      media: "muted",
     }[item.role];
     return themeFg(this.theme, color, raw);
   }
