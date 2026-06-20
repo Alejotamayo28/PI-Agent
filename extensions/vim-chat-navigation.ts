@@ -13,20 +13,35 @@ import { CustomEditor, type ExtensionAPI } from "@earendil-works/pi-coding-agent
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 type VimChatMode = "insert" | "chat";
-type MessageRole = "user" | "assistant";
+type MessageRole = "user" | "assistant" | "toolResult" | "bashExecution" | "custom" | "branchSummary" | "compactionSummary" | "entry" | "media";
 type NavigatorMode = "normal" | "visualLine" | "visualChar";
+type RenderedLineKind = "separator" | "title" | "body" | "detail";
 
 interface ChatHistoryItem {
   id: string;
   role: MessageRole;
   title: string;
   body: string;
+  markdown?: boolean;
+}
+
+interface ExtractedContentBlock {
+  kind: "text" | "image";
+  text: string;
+}
+
+interface ContentExtractionOptions {
+  includeText?: boolean;
+  includeImages?: boolean;
+  includeThinking?: boolean;
+  includeToolCalls?: boolean;
 }
 
 interface RenderedLine {
   itemIndex: number;
-  text: string;
-  kind: "separator" | "title" | "body";
+  rawText: string;
+  displayText?: string;
+  kind: RenderedLineKind;
 }
 
 interface TextRange {
@@ -39,7 +54,6 @@ type OpenChatNavigator = () => void;
 type IsIdleHandler = () => boolean;
 type YankHandler = (text: string) => void | Promise<void>;
 
-const MAX_BODY_CHARS = 8_000;
 const DEFAULT_VISIBLE_HISTORY_LINES = 20;
 
 function isPrintable(data: string): boolean {
@@ -56,8 +70,7 @@ function cleanText(value: unknown): string {
 }
 
 function truncateBody(text: string): string {
-  if (text.length <= MAX_BODY_CHARS) return text;
-  return `${text.slice(0, MAX_BODY_CHARS)}\n… [truncated for chat navigator]`;
+  return text;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -89,6 +102,49 @@ function formatPathWithRange(path: string, args: Record<string, unknown>): strin
   return path;
 }
 
+function isPrimitivePlain(value: unknown): boolean {
+  return value === undefined || value === null || ["string", "number", "boolean"].includes(typeof value);
+}
+
+function indentPlain(text: string, indent: number): string {
+  const padding = " ".repeat(indent);
+  return cleanText(text).split("\n").map((line) => `${padding}${line}`).join("\n");
+}
+
+function formatPlainValue(value: unknown, indent = 0): string {
+  const padding = " ".repeat(indent);
+
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+  if (typeof value === "string") return cleanText(value);
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return `${padding}[]`;
+    return value.map((item) => {
+      if (isPrimitivePlain(item)) return `${padding}- ${formatPlainValue(item, 0)}`;
+      return `${padding}-\n${formatPlainValue(item, indent + 2)}`;
+    }).join("\n");
+  }
+
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    if (entries.length === 0) return `${padding}{}`;
+
+    return entries.map(([key, nested]) => {
+      if (isPrimitivePlain(nested)) {
+        const text = formatPlainValue(nested, 0);
+        if (!text.includes("\n")) return `${padding}${key}: ${text}`;
+        return `${padding}${key}:\n${indentPlain(text, indent + 2)}`;
+      }
+      return `${padding}${key}:\n${formatPlainValue(nested, indent + 2)}`;
+    }).join("\n");
+  }
+
+  return cleanText(String(value));
+}
+
+
 function compactJson(value: unknown): string {
   try {
     return truncateInline(JSON.stringify(value));
@@ -97,66 +153,101 @@ function compactJson(value: unknown): string {
   }
 }
 
-function formatThinkingBlock(block: Record<string, unknown>): string {
-  return cleanText(block.thinking);
+function imagePlaceholder(block: Record<string, unknown>): string {
+  const mimeType = typeof block.mimeType === "string" && block.mimeType.trim()
+    ? block.mimeType.trim()
+    : "image";
+  return `[image: ${mimeType}]`;
+}
+
+function formatToolCallArguments(args: Record<string, unknown>): string {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (typeof value === "string") {
+      const cleaned = cleanText(value);
+      lines.push(cleaned.includes("\n") ? `${key}:\n${cleaned}` : `${key}: ${cleaned}`);
+    } else if (typeof value === "number" || typeof value === "boolean" || value === null) {
+      lines.push(`${key}: ${String(value)}`);
+    } else {
+      lines.push(`${key}:\n${formatPlainValue(value)}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function formatToolCallBlock(block: Record<string, unknown>): string {
   const name = typeof block.name === "string" && block.name.trim() ? block.name.trim() : "toolCall";
   const args = isRecord(block.arguments) ? block.arguments : undefined;
-  if (!args) return name;
+  if (!args) return `[tool call: ${name}]`;
 
-  const path = stringArgument(args, "path");
-  const pattern = stringArgument(args, "pattern");
-  const query = stringArgument(args, "query");
   const command = stringArgument(args, "command");
+  if (name === "bash" && command) return `[tool call: bash]\n${command}`;
 
-  switch (name) {
-    case "read":
-      return path ? `read ${formatPathWithRange(path, args)}` : "read";
-    case "write":
-      return path ? `write ${path}` : "write";
-    case "edit":
-      return path ? `edit ${path}` : "edit";
-    case "bash":
-      return command ? `bash ${truncateInline(command.split("\n")[0] ?? "")}` : "bash";
-    case "grep":
-      return truncateInline(["grep", pattern, path].filter(Boolean).join(" ")) || "grep";
-    case "find":
-      return truncateInline(["find", pattern || query, path].filter(Boolean).join(" ")) || "find";
-    case "ls":
-      return path ? `ls ${path}` : "ls";
-    case "web_search":
-      return query ? `web_search ${truncateInline(query)}` : "web_search";
-    case "fetch_content": {
-      const url = stringArgument(args, "url");
-      return url ? `fetch_content ${truncateInline(url)}` : "fetch_content";
-    }
-    default:
-      return `${name} ${compactJson(args)}`.trim();
-  }
+  return `[tool call: ${name}]\n${formatToolCallArguments(args)}`.trimEnd();
 }
 
-function contentToDisplayText(content: unknown): string {
-  if (typeof content === "string") return cleanText(content);
-  if (!Array.isArray(content)) return cleanText(content);
 
-  const parts = content.map((block) => {
-    if (!isRecord(block)) return "";
+function extractContentBlocks(content: unknown, options: ContentExtractionOptions = {}): ExtractedContentBlock[] {
+  const includeText = options.includeText ?? true;
+  const includeImages = options.includeImages ?? true;
+  const includeThinking = options.includeThinking ?? false;
+  const includeToolCalls = options.includeToolCalls ?? false;
+
+  if (typeof content === "string") {
+    const text = cleanText(content);
+    return includeText && text ? [{ kind: "text", text }] : [];
+  }
+
+  if (!Array.isArray(content)) {
+    const text = isRecord(content) ? formatPlainValue(content) : cleanText(content);
+    return includeText && text ? [{ kind: "text", text }] : [];
+  }
+
+  const blocks: ExtractedContentBlock[] = [];
+  for (const block of content) {
+    if (!isRecord(block)) continue;
 
     switch (block.type) {
-      case "text":
-        return cleanText(block.text);
-      case "thinking":
-        return formatThinkingBlock(block);
-      case "toolCall":
-        return formatToolCallBlock(block);
+      case "text": {
+        if (!includeText) break;
+        const text = cleanText(block.text);
+        if (text) blocks.push({ kind: "text", text });
+        break;
+      }
+      case "image":
+        if (includeImages) blocks.push({ kind: "image", text: imagePlaceholder(block) });
+        break;
+      case "thinking": {
+        if (!includeThinking) break;
+        const text = cleanText(block.thinking);
+        if (text) blocks.push({ kind: "text", text: `[thinking]\n${text}` });
+        break;
+      }
+      case "toolCall": {
+        if (!includeToolCalls) break;
+        const text = formatToolCallBlock(block);
+        if (text) blocks.push({ kind: "text", text });
+        break;
+      }
       default:
-        return "";
+        break;
     }
-  });
+  }
 
-  return cleanText(parts.filter(Boolean).join("\n\n"));
+  return blocks;
+}
+
+function contentBlocksToText(blocks: ExtractedContentBlock[]): string {
+  return cleanText(blocks.map((block) => block.text).filter(Boolean).join("\n\n"));
+}
+
+function extractDisplayText(content: unknown, options?: ContentExtractionOptions): string {
+  return contentBlocksToText(extractContentBlocks(content, options));
+}
+
+function detailsText(details: unknown): string {
+  if (details === undefined || details === null) return "";
+  return `details:\n${formatPlainValue(details)}`;
 }
 
 function formatTimestamp(message: Record<string, any>, entry: Record<string, any>): string {
@@ -172,42 +263,179 @@ function titleWithTime(label: string, time: string): string {
   return time ? `${label} ${time}` : label;
 }
 
+function messageEntryId(entry: Record<string, any>, fallbackPrefix: string): string {
+  return entry.id ?? `${fallbackPrefix}-${entry.timestamp ?? Math.random()}`;
+}
+
 function formatUserMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  const body = extractDisplayText(message.content, { includeImages: true }) || "[empty user message]";
   return {
-    id: entry.id ?? `user-${entry.timestamp ?? Math.random()}`,
+    id: messageEntryId(entry, "user"),
     role: "user",
     title: titleWithTime("USER", formatTimestamp(message, entry)),
-    body: truncateBody(contentToDisplayText(message.content) || "[empty user message]"),
+    body: truncateBody(body),
+    markdown: true,
   };
 }
 
-function formatAssistantMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem | undefined {
-  const body = contentToDisplayText(message.content);
-  if (!body.trim()) return undefined;
+function formatAssistantMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  const body = extractDisplayText(message.content, {
+    includeText: true,
+    includeImages: true,
+    includeThinking: true,
+    includeToolCalls: true,
+  });
+  const assistantBody = body.trim() ? body : "[empty assistant message]";
 
   const model = message.model ? ` · ${message.model}` : "";
   return {
-    id: entry.id ?? `assistant-${entry.timestamp ?? Math.random()}`,
+    id: messageEntryId(entry, "assistant"),
     role: "assistant",
     title: titleWithTime(`ASSISTANT${model}`, formatTimestamp(message, entry)),
-    body: truncateBody(body),
+    body: truncateBody(assistantBody),
+    markdown: true,
   };
+}
+
+function formatToolResultMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  const toolName = typeof message.toolName === "string" && message.toolName.trim()
+    ? message.toolName.trim()
+    : "tool";
+  const status = message.isError ? "ERROR" : "OK";
+  const body = extractDisplayText(message.content, { includeImages: true }) || "[empty tool result]";
+
+  return {
+    id: messageEntryId(entry, "tool-result"),
+    role: "toolResult",
+    title: titleWithTime(`TOOL ${toolName} · ${status}`, formatTimestamp(message, entry)),
+    body: truncateBody(body),
+    markdown: false,
+  };
+}
+
+function bashStatus(message: Record<string, any>): string {
+  if (message.cancelled) return "cancelled";
+  const exitCode = typeof message.exitCode === "number" ? message.exitCode : undefined;
+  if (exitCode === undefined) return "no exit";
+  return `exit ${exitCode}`;
+}
+
+function formatBashExecutionMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem | undefined {
+  const command = cleanText(message.command).trim();
+  const output = cleanText(message.output);
+  const statusParts = [bashStatus(message)];
+  if (message.truncated) statusParts.push("truncated");
+  if (message.excludeFromContext) statusParts.push("local");
+
+  const bodyParts = [command ? `$ ${command}` : "$ [empty command]"];
+  bodyParts.push(output || "[no output]");
+  if (message.truncated && message.fullOutputPath) {
+    bodyParts.push(`[full output: ${cleanText(message.fullOutputPath)}]`);
+  } else if (message.truncated) {
+    bodyParts.push("[output truncated]");
+  }
+
+  return {
+    id: messageEntryId(entry, "bash"),
+    role: "bashExecution",
+    title: titleWithTime(`BASH · ${statusParts.join(" · ")}`, formatTimestamp(message, entry)),
+    body: truncateBody(bodyParts.filter(Boolean).join("\n\n")),
+    markdown: false,
+  };
+}
+
+function formatCustomMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  const customType = typeof message.customType === "string" && message.customType.trim()
+    ? message.customType.trim()
+    : "custom";
+  const visibility = message.display === false ? " · hidden" : "";
+  const body = extractDisplayText(message.content, { includeImages: true }) || "[empty custom message]";
+
+  return {
+    id: messageEntryId(entry, "custom"),
+    role: "custom",
+    title: titleWithTime(`CUSTOM · ${customType}${visibility}`, formatTimestamp(message, entry)),
+    body: truncateBody(body),
+    markdown: true,
+  };
+}
+
+function formatBranchSummaryMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  return {
+    id: messageEntryId(entry, "branch-summary"),
+    role: "branchSummary",
+    title: titleWithTime("BRANCH SUMMARY", formatTimestamp(message, entry)),
+    body: truncateBody(cleanText(message.summary) || "[empty branch summary]"),
+    markdown: true,
+  };
+}
+
+function formatCompactionSummaryMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  return {
+    id: messageEntryId(entry, "compaction-summary"),
+    role: "compactionSummary",
+    title: titleWithTime("COMPACTION SUMMARY", formatTimestamp(message, entry)),
+    body: truncateBody(cleanText(message.summary) || "[empty compaction summary]"),
+    markdown: true,
+  };
+}
+
+function formatUnknownMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+  const role = typeof message.role === "string" && message.role.trim() ? message.role.trim() : "unknown";
+  const body = extractDisplayText(message.content, {
+    includeText: true,
+    includeImages: true,
+    includeThinking: true,
+    includeToolCalls: true,
+  }) || cleanText(message.summary) || cleanText(message.output) || "[empty message]";
+  return {
+    id: messageEntryId(entry, `message-${role}`),
+    role: "entry",
+    title: titleWithTime(`MESSAGE · ${role}`, formatTimestamp(message, entry)),
+    body: truncateBody(body),
+    markdown: true,
+  };
+}
+
+function formatGenericEntry(_entry: Record<string, any>): ChatHistoryItem | undefined {
+  return undefined;
 }
 
 function formatMessageEntry(entry: Record<string, any>): ChatHistoryItem | undefined {
   if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") {
-    return undefined;
+    return formatGenericEntry(entry);
   }
 
   const message = entry.message as Record<string, any>;
+  let item: ChatHistoryItem;
   switch (message.role) {
     case "user":
-      return formatUserMessage(message, entry);
+      item = formatUserMessage(message, entry);
+      break;
     case "assistant":
-      return formatAssistantMessage(message, entry);
+      item = formatAssistantMessage(message, entry);
+      break;
+    case "toolResult":
+      item = formatToolResultMessage(message, entry);
+      break;
+    case "bashExecution":
+      item = formatBashExecutionMessage(message, entry);
+      break;
+    case "custom":
+      item = formatCustomMessage(message, entry);
+      break;
+    case "branchSummary":
+      item = formatBranchSummaryMessage(message, entry);
+      break;
+    case "compactionSummary":
+      item = formatCompactionSummaryMessage(message, entry);
+      break;
     default:
-      return undefined;
+      item = formatUnknownMessage(message, entry);
+      break;
   }
+
+  return item;
 }
 
 function getChatHistoryItems(branchEntries: readonly unknown[]): ChatHistoryItem[] {
@@ -270,6 +498,55 @@ function clamp(value: number, min: number, max: number): number {
 function comparePosition(aLine: number, aColumn: number, bLine: number, bColumn: number): number {
   if (aLine !== bLine) return aLine - bLine;
   return aColumn - bColumn;
+}
+
+function themeFg(theme: any, color: string, text: string): string {
+  try {
+    return typeof theme?.fg === "function" ? theme.fg(color, text) : text;
+  } catch {
+    return text;
+  }
+}
+
+function styleInlineMarkdown(text: string, theme: any): string {
+  const segments = text.split(/(`[^`]*`)/g);
+  return segments.map((segment) => {
+    if (segment.startsWith("`") && segment.endsWith("`") && segment.length >= 2) {
+      return themeFg(theme, "mdCode", segment);
+    }
+
+    return segment
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => {
+        return `${themeFg(theme, "mdLink", String(label))}${themeFg(theme, "dim", ` (${String(url)})`)}`;
+      })
+      .replace(/\*\*([^*]+)\*\*/g, (_match, value) => themeFg(theme, "accent", String(value)));
+  }).join("");
+}
+
+function styleMarkdownLine(text: string, theme: any, state: { inCodeFence: boolean }): string {
+  const trimmed = text.trimStart();
+  const leading = text.slice(0, text.length - trimmed.length);
+
+  if (/^```/.test(trimmed)) {
+    const styled = themeFg(theme, "mdCodeBlockBorder", text);
+    state.inCodeFence = !state.inCodeFence;
+    return styled;
+  }
+
+  if (state.inCodeFence) return themeFg(theme, "mdCodeBlock", text);
+  if (!trimmed.trim()) return text;
+
+  if (/^#{1,6}\s+/.test(trimmed)) return leading + themeFg(theme, "mdHeading", trimmed);
+  if (/^>\s?/.test(trimmed)) {
+    return leading + themeFg(theme, "mdQuoteBorder", ">") + themeFg(theme, "mdQuote", trimmed.replace(/^>\s?/, " "));
+  }
+  if (/^([-*_])\s*\1\s*\1(?:\s*\1)*\s*$/.test(trimmed)) return leading + themeFg(theme, "mdHr", trimmed);
+  if (/^([-*+] |\d+\.\s+)/.test(trimmed)) {
+    const marker = trimmed.match(/^([-*+] |\d+\.\s+)/)?.[0] ?? "";
+    return leading + themeFg(theme, "mdListBullet", marker) + styleInlineMarkdown(trimmed.slice(marker.length), theme);
+  }
+
+  return leading + styleInlineMarkdown(trimmed, theme);
 }
 
 function runClipboardCommand(command: string, args: string[], text: string): Promise<void> {
@@ -372,7 +649,7 @@ class ChatHistoryNavigator {
     const selectedItem = historyLines[this.selectedLine]?.itemIndex ?? 0;
     const header = this.theme.fg("accent", ` ${this.modeLabel()} `) + this.theme.fg(
       "muted",
-      `current session text • j/k move • V line select • v char select • y yank • Esc cancel/close`,
+      `current session transcript • j/k move • h/l message • V line select • v char select • y yank • Esc cancel/close`,
     );
     const position = this.theme.fg(
       "dim",
@@ -387,7 +664,7 @@ class ChatHistoryNavigator {
     ];
 
     if (this.items.length === 0) {
-      lines.push(this.padLine(this.theme.fg("muted", "No text chat history yet."), safeWidth));
+      lines.push(this.padLine(this.theme.fg("muted", "No session transcript yet."), safeWidth));
     } else {
       const visible = historyLines.slice(this.scrollTop, this.scrollTop + visibleCount);
       for (let i = 0; i < visibleCount; i++) {
@@ -405,7 +682,7 @@ class ChatHistoryNavigator {
         }
 
         const marker = globalIndex === this.selectedLine ? "▶ " : "  ";
-        const renderedText = this.renderHistoryLine(globalIndex, line.text);
+        const renderedText = this.renderHistoryLine(globalIndex, line);
         const text = truncateToWidth(`${marker}${renderedText}`, safeWidth - 2, "…");
         const shouldHighlightWholeLine = this.mode === "normal" && globalIndex === this.selectedLine;
         lines.push(
@@ -542,7 +819,7 @@ class ChatHistoryNavigator {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     if (this.mode === "visualLine") {
       const [start, end] = this.getOrderedLineRange();
-      return lines.slice(start, end + 1).map((line) => line.text).join("\n");
+      return lines.slice(start, end + 1).map((line) => line.rawText).join("\n");
     }
 
     if (this.mode !== "visualChar") return "";
@@ -550,7 +827,7 @@ class ChatHistoryNavigator {
     const [startLine, endLine] = this.getOrderedLineRange();
     const selected: string[] = [];
     for (let lineIndex = startLine; lineIndex <= endLine; lineIndex++) {
-      const text = lines[lineIndex]?.text ?? "";
+      const text = lines[lineIndex]?.rawText ?? "";
       const range = this.getVisualCharRangeForLine(lineIndex, text);
       if (!range) {
         selected.push("");
@@ -567,30 +844,61 @@ class ChatHistoryNavigator {
 
     const lines: RenderedLine[] = [];
     this.items.forEach((item, itemIndex) => {
-      lines.push({ itemIndex, text: "", kind: "separator" });
+      lines.push({ itemIndex, rawText: "", kind: "separator" });
       lines.push({
         itemIndex,
-        text: this.formatTitle(item),
+        rawText: this.formatTitle(item),
+        displayText: this.formatTitle(item, true),
         kind: "title",
       });
 
       const bodyWidth = Math.max(1, width - 2);
-      for (const bodyLine of wrapPlainText(item.body, bodyWidth)) {
-        lines.push({ itemIndex, text: `  ${bodyLine}`, kind: "body" });
+      const markdownState = { inCodeFence: false };
+      for (const sourceLine of cleanText(item.body).split("\n")) {
+        for (const bodyLine of wrapPlainLine(sourceLine || " ", bodyWidth)) {
+          const rawText = `  ${bodyLine}`;
+          const displayBody = item.markdown === false
+            ? bodyLine
+            : styleMarkdownLine(bodyLine, this.theme, markdownState);
+          lines.push({ itemIndex, rawText, displayText: `  ${displayBody}`, kind: "body" });
+        }
       }
     });
 
     this.cachedWidth = width;
-    this.cachedLines = lines.length > 0 ? lines : [{ itemIndex: 0, text: "No text chat history yet.", kind: "body" }];
+    this.cachedLines = lines.length > 0
+      ? lines
+      : [{ itemIndex: 0, rawText: "No session transcript yet.", displayText: this.theme.fg("muted", "No session transcript yet."), kind: "body" }];
     return this.cachedLines;
   }
 
-  private formatTitle(item: ChatHistoryItem): string {
+  private formatTitle(item: ChatHistoryItem, styled = false): string {
     const icon = {
       user: "",
       assistant: "π",
+      toolResult: "🔧",
+      bashExecution: "$",
+      custom: "◇",
+      branchSummary: "⑂",
+      compactionSummary: "⬡",
+      entry: "·",
+      media: "▧",
     }[item.role];
-    return `${icon} ${item.title}`;
+    const raw = `${icon} ${item.title}`;
+    if (!styled) return raw;
+
+    const color = {
+      user: "userMessageText",
+      assistant: "accent",
+      toolResult: item.title.includes("ERROR") ? "error" : "success",
+      bashExecution: item.title.includes("exit 0") ? "success" : item.title.includes("cancelled") ? "warning" : "error",
+      custom: "customMessageLabel",
+      branchSummary: "muted",
+      compactionSummary: "muted",
+      entry: "dim",
+      media: "muted",
+    }[item.role];
+    return themeFg(this.theme, color, raw);
   }
 
   private modeLabel(): string {
@@ -673,17 +981,20 @@ class ChatHistoryNavigator {
     this.requestRender();
   }
 
-  private renderHistoryLine(lineIndex: number, text: string): string {
+  private renderHistoryLine(lineIndex: number, line: RenderedLine): string {
+    const rawText = line.rawText;
+    const displayText = line.displayText ?? rawText;
+
     if (this.mode === "visualLine" && this.isLineInVisualLineRange(lineIndex)) {
-      return this.theme.bg("selectedBg", text || " ");
+      return this.theme.bg("selectedBg", displayText || " ");
     }
 
     if (this.mode === "visualChar") {
-      const range = this.getVisualCharRangeForLine(lineIndex, text);
-      if (range) return this.applyRangeBackground(text, range);
+      const range = this.getVisualCharRangeForLine(lineIndex, rawText);
+      if (range) return this.applyRangeBackground(rawText, range);
     }
 
-    return text;
+    return displayText;
   }
 
   private getOrderedLineRange(): [number, number] {
@@ -757,7 +1068,7 @@ class ChatHistoryNavigator {
 
   private maxColumnForLine(lineIndex: number): number {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
-    const text = lines[lineIndex]?.text ?? "";
+    const text = lines[lineIndex]?.rawText ?? "";
     return Math.max(0, textChars(text).length - 1);
   }
 
