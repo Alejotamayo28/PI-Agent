@@ -10,8 +10,8 @@
     "./extensions/skill-model-router.ts",
     "./extensions/vim-chat-navigation.ts"
   ],
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.5",
+  "defaultProvider": "nvidia-nim",
+  "defaultModel": "z-ai/glm-5.1",
   "hideThinkingBlock": false,
   "defaultThinkingLevel": "high",
   "subagents": {

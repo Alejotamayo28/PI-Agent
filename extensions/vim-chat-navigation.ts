@@ -53,6 +53,21 @@ type IsIdleHandler = () => boolean;
 type YankHandler = (text: string) => void | Promise<void>;
 
 const DEFAULT_VISIBLE_HISTORY_LINES = 20;
+const MIN_VISIBLE_HISTORY_LINES = 10;
+const OVERLAY_CHROME_LINES = 5; // top/header/position/middle/bottom
+const OVERLAY_HEIGHT_RATIO = 0.95;
+
+function getVisibleHistoryLineCount(): number {
+  const rows = typeof process.stdout.rows === "number" ? process.stdout.rows : 0;
+  if (rows <= 0) return DEFAULT_VISIBLE_HISTORY_LINES;
+
+  const maxOverlayRows = Math.max(1, Math.floor(rows * OVERLAY_HEIGHT_RATIO));
+  const availableHistoryRows = Math.max(1, maxOverlayRows - OVERLAY_CHROME_LINES);
+
+  return rows >= OVERLAY_CHROME_LINES + MIN_VISIBLE_HISTORY_LINES
+    ? Math.max(MIN_VISIBLE_HISTORY_LINES, availableHistoryRows)
+    : availableHistoryRows;
+}
 
 function isPrintable(data: string): boolean {
   return data.length === 1 && data.charCodeAt(0) >= 32;
@@ -584,7 +599,7 @@ class ChatHistoryNavigator {
     const safeWidth = Math.max(20, width);
     const contentWidth = Math.max(10, safeWidth - 4);
     const historyLines = this.getRenderedLines(contentWidth);
-    const visibleCount = DEFAULT_VISIBLE_HISTORY_LINES;
+    const visibleCount = getVisibleHistoryLineCount();
     this.clampSelection(historyLines.length);
     this.ensureVisualStateInBounds(historyLines.length);
     this.ensureSelectionVisible(visibleCount, historyLines.length);
@@ -1152,9 +1167,9 @@ export default function(pi: ExtensionAPI) {
           overlayOptions: {
             width: "90%",
             minWidth: 50,
-            maxHeight: "80%",
+            maxHeight: "95%",
             anchor: "center",
-            margin: 1,
+            margin: 0,
           },
         },
       ).then(returnToInsert, returnToInsert);
