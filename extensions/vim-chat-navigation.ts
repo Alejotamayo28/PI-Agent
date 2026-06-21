@@ -619,8 +619,11 @@ class ChatHistoryNavigator {
         }
 
         if (line.kind === "separator") {
+          const inVisualLineRange = this.mode === "visualLine" && this.isLineInVisualLineRange(globalIndex);
           const separator = this.theme.fg("borderMuted", "─".repeat(Math.max(0, safeWidth - 2)));
-          lines.push(this.padLine(separator, safeWidth));
+          lines.push(
+            this.padLine(inVisualLineRange ? this.theme.bg("selectedBg", separator) : separator, safeWidth),
+          );
           continue;
         }
 
@@ -932,7 +935,12 @@ class ChatHistoryNavigator {
 
     if (this.mode === "visualChar") {
       const range = this.getVisualCharRangeForLine(lineIndex, rawText);
-      if (range) return this.applyRangeBackground(rawText, range);
+      if (range) {
+        // Highlight the whole line — working on displayText preserves
+        // markdown/ANSI styling that rawText discards.  Character-level
+        // selection precision is still used for yanking (getSelectedText).
+        return this.theme.bg("selectedBg", displayText || " ");
+      }
     }
 
     return displayText;
@@ -1004,7 +1012,14 @@ class ChatHistoryNavigator {
 
   private findItemTitleLine(lines: RenderedLine[], itemIndex: number): number {
     const titleLine = lines.findIndex((line) => line.itemIndex === itemIndex && line.kind === "title");
-    return titleLine >= 0 ? titleLine : lines.findIndex((line) => line.itemIndex === itemIndex);
+    if (titleLine >= 0) return titleLine;
+
+    // Fallback: first non-separator line of the target item — never land on an
+    // invisible separator where the ▶ cursor / selection highlight is hidden.
+    const firstBody = lines.findIndex(
+      (line) => line.itemIndex === itemIndex && line.kind !== "separator",
+    );
+    return firstBody >= 0 ? firstBody : -1;
   }
 
   private maxColumnForLine(lineIndex: number): number {
