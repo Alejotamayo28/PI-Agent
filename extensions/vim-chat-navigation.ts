@@ -622,7 +622,7 @@ function runClipboardCommand(command: string, args: string[], text: string): Pro
 
 function formatAskSelectionPrompt(text: string): string {
   const selectedText = cleanText(text).replace(/^\n+/, "").replace(/\n+$/, "");
-  return `Explain this selected text/code:\n\n\`\`\`text\n${selectedText}\n\`\`\``;
+  return `\`\`\`text\n${selectedText}\n\`\`\``;
 }
 
 async function copyText(text: string): Promise<void> {
