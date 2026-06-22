@@ -15,7 +15,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tu
 type VimChatMode = "insert" | "chat";
 type MessageRole = "user" | "assistant" | "toolResult" | "bashExecution" | "custom" | "branchSummary" | "compactionSummary" | "entry";
 type NavigatorMode = "normal" | "visualLine" | "visualChar";
-type RenderedLineKind = "separator" | "title" | "body";
+type RenderedLineKind = "separator" | "title" | "accordion" | "body";
 type SectionSeparatorLabel = "PROMPT" | "AGENT RESULT";
 
 interface ChatHistoryItem {
@@ -23,6 +23,7 @@ interface ChatHistoryItem {
   title: string;
   body: string;
   markdown?: boolean;
+  accordionSummary?: string;
 }
 
 interface ExtractedContentBlock {
@@ -42,6 +43,7 @@ interface RenderedLine {
   displayText?: string;
   kind: RenderedLineKind;
   separatorLabel?: SectionSeparatorLabel;
+  accordionExpanded?: boolean;
 }
 
 interface TextRange {
@@ -245,6 +247,67 @@ function titleWithTime(label: string, time: string): string {
   return time ? `${label} ${time}` : label;
 }
 
+function compactLine(text: string, maxWidth = 120): string {
+  const compact = cleanText(text).replace(/\s+/g, " ").trim();
+  return compact ? truncateToWidth(compact, maxWidth, "…") : "";
+}
+
+function firstMeaningfulLine(text: string): string {
+  return cleanText(text).split("\n").map((line) => line.trim()).find(Boolean) ?? "";
+}
+
+function summarizeGenericToolArguments(args: Record<string, unknown>): string {
+  for (const key of ["path", "file", "url", "query", "pattern", "command"]) {
+    const value = stringArgument(args, key);
+    if (value) return value;
+  }
+
+  for (const [key, value] of Object.entries(args)) {
+    if (isPrimitivePlain(value)) {
+      const text = compactLine(formatPlainValue(value), 80);
+      if (text) return `${key}: ${text}`;
+    }
+  }
+
+  return "";
+}
+
+function summarizeToolCallAction(name: string, args: Record<string, unknown> | undefined): string {
+  if (!args) return "";
+
+  if (name === "bash") return stringArgument(args, "command");
+  if (["read", "write", "edit"].includes(name)) return stringArgument(args, "path");
+  if (name === "grep") {
+    const pattern = stringArgument(args, "pattern");
+    const path = stringArgument(args, "path");
+    return [pattern, path].filter(Boolean).join(" in ");
+  }
+  if (name === "find") {
+    const pattern = stringArgument(args, "pattern");
+    const path = stringArgument(args, "path");
+    return [pattern, path].filter(Boolean).join(" under ");
+  }
+  if (name === "ls") return stringArgument(args, "path");
+
+  return summarizeGenericToolArguments(args);
+}
+
+function extractToolCallSummaries(content: unknown): Map<string, string> {
+  const summaries = new Map<string, string>();
+  if (!Array.isArray(content)) return summaries;
+
+  for (const block of content) {
+    if (!isRecord(block) || block.type !== "toolCall") continue;
+    const id = typeof block.id === "string" && block.id.trim() ? block.id.trim() : "";
+    const name = typeof block.name === "string" && block.name.trim() ? block.name.trim() : "tool";
+    const args = isRecord(block.arguments) ? block.arguments : undefined;
+    const action = compactLine(summarizeToolCallAction(name, args));
+    if (id && action) summaries.set(id, action);
+  }
+
+  return summaries;
+}
+
 function formatUserMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
   const body = extractDisplayText(message.content, { includeImages: true }) || "[empty user message]";
   return {
@@ -273,18 +336,24 @@ function formatAssistantMessage(message: Record<string, any>, entry: Record<stri
   };
 }
 
-function formatToolResultMessage(message: Record<string, any>, entry: Record<string, any>): ChatHistoryItem {
+function formatToolResultMessage(
+  message: Record<string, any>,
+  entry: Record<string, any>,
+  toolCallSummary?: string,
+): ChatHistoryItem {
   const toolName = typeof message.toolName === "string" && message.toolName.trim()
     ? message.toolName.trim()
     : "tool";
   const status = message.isError ? "ERROR" : "OK";
   const body = extractDisplayText(message.content, { includeImages: true }) || "[empty tool result]";
+  const accordionSummary = compactLine(toolCallSummary || firstMeaningfulLine(body) || "result");
 
   return {
     role: "toolResult",
     title: titleWithTime(`TOOL ${toolName} · ${status}`, formatTimestamp(message, entry)),
     body: truncateBody(body),
     markdown: false,
+    accordionSummary,
   };
 }
 
@@ -315,6 +384,7 @@ function formatBashExecutionMessage(message: Record<string, any>, entry: Record<
     title: titleWithTime(`BASH · ${statusParts.join(" · ")}`, formatTimestamp(message, entry)),
     body: truncateBody(bodyParts.filter(Boolean).join("\n\n")),
     markdown: false,
+    accordionSummary: compactLine(command || "[empty command]"),
   };
 }
 
@@ -367,7 +437,10 @@ function formatUnknownMessage(message: Record<string, any>, entry: Record<string
   };
 }
 
-function formatMessageEntry(entry: Record<string, any>): ChatHistoryItem | undefined {
+function formatMessageEntry(
+  entry: Record<string, any>,
+  toolCallSummaries: Map<string, string> = new Map(),
+): ChatHistoryItem | undefined {
   if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") {
     return undefined;
   }
@@ -381,9 +454,11 @@ function formatMessageEntry(entry: Record<string, any>): ChatHistoryItem | undef
     case "assistant":
       item = formatAssistantMessage(message, entry);
       break;
-    case "toolResult":
-      item = formatToolResultMessage(message, entry);
+    case "toolResult": {
+      const toolCallId = typeof message.toolCallId === "string" ? message.toolCallId : "";
+      item = formatToolResultMessage(message, entry, toolCallSummaries.get(toolCallId));
       break;
+    }
     case "bashExecution":
       item = formatBashExecutionMessage(message, entry);
       break;
@@ -405,9 +480,23 @@ function formatMessageEntry(entry: Record<string, any>): ChatHistoryItem | undef
 }
 
 function getChatHistoryItems(branchEntries: readonly unknown[]): ChatHistoryItem[] {
-  return branchEntries
-    .map((entry) => formatMessageEntry((entry ?? {}) as Record<string, any>))
-    .filter((item): item is ChatHistoryItem => Boolean(item));
+  const toolCallSummaries = new Map<string, string>();
+  const items: ChatHistoryItem[] = [];
+
+  for (const rawEntry of branchEntries) {
+    const entry = (rawEntry ?? {}) as Record<string, any>;
+    const item = formatMessageEntry(entry, toolCallSummaries);
+    if (item) items.push(item);
+
+    if (entry.type === "message" && entry.message && typeof entry.message === "object") {
+      const message = entry.message as Record<string, any>;
+      extractToolCallSummaries(message.content).forEach((summary, id) => {
+        toolCallSummaries.set(id, summary);
+      });
+    }
+  }
+
+  return items;
 }
 
 function getSectionSeparatorLabel(
@@ -574,6 +663,7 @@ class ChatHistoryNavigator {
   private anchorColumn = 0;
   private cursorColumn = 0;
   private preferredColumn = 0;
+  private readonly expandedAccordionItems = new Set<number>();
 
   constructor(
     private readonly items: ChatHistoryItem[],
@@ -594,6 +684,7 @@ class ChatHistoryNavigator {
     }
 
     if (matchesKey(data, "enter")) {
+      if (this.mode === "normal" && this.toggleSelectedAccordionItem()) return;
       this.requestRender();
       return;
     }
@@ -618,7 +709,7 @@ class ChatHistoryNavigator {
     const selectedItem = historyLines[this.selectedLine]?.itemIndex ?? 0;
     const header = this.theme.fg("accent", ` ${this.modeLabel()} `) + this.theme.fg(
       "muted",
-      `current session transcript • j/k move • h/l message • V line select • v char select • y yank • Esc cancel/close`,
+      `current session transcript • j/k move • h/l message • Enter toggle tool • V line select • v char select • y yank • Esc cancel/close`,
     );
     const position = this.theme.fg(
       "dim",
@@ -816,19 +907,7 @@ class ChatHistoryNavigator {
     if (this.cachedWidth === width && this.cachedLines) return this.cachedLines;
 
     const lines: RenderedLine[] = [];
-    this.items.forEach((item, itemIndex) => {
-      const separatorLabel = getSectionSeparatorLabel(item, this.items[itemIndex - 1]);
-      if (separatorLabel) {
-        lines.push({ itemIndex, rawText: "", kind: "separator", separatorLabel });
-      }
-
-      lines.push({
-        itemIndex,
-        rawText: this.formatTitle(item),
-        displayText: this.formatTitle(item, true),
-        kind: "title",
-      });
-
+    const appendBodyLines = (item: ChatHistoryItem, itemIndex: number) => {
       const bodyWidth = Math.max(1, width - 2);
       const markdownState = { inCodeFence: false };
       for (const sourceLine of cleanText(item.body).split("\n")) {
@@ -840,6 +919,34 @@ class ChatHistoryNavigator {
           lines.push({ itemIndex, rawText, displayText: `  ${displayBody}`, kind: "body" });
         }
       }
+    };
+
+    this.items.forEach((item, itemIndex) => {
+      const separatorLabel = getSectionSeparatorLabel(item, this.items[itemIndex - 1]);
+      if (separatorLabel) {
+        lines.push({ itemIndex, rawText: "", kind: "separator", separatorLabel });
+      }
+
+      if (this.isAccordionItem(itemIndex)) {
+        const accordionExpanded = this.expandedAccordionItems.has(itemIndex);
+        lines.push({
+          itemIndex,
+          rawText: this.formatAccordionLine(item, accordionExpanded),
+          displayText: this.formatAccordionLine(item, accordionExpanded, true),
+          kind: "accordion",
+          accordionExpanded,
+        });
+        if (accordionExpanded) appendBodyLines(item, itemIndex);
+        return;
+      }
+
+      lines.push({
+        itemIndex,
+        rawText: this.formatTitle(item),
+        displayText: this.formatTitle(item, true),
+        kind: "title",
+      });
+      appendBodyLines(item, itemIndex);
     });
 
     this.cachedWidth = width;
@@ -874,6 +981,44 @@ class ChatHistoryNavigator {
       entry: "dim",
     }[item.role];
     return themeFg(this.theme, color, raw);
+  }
+
+  private formatAccordionLine(item: ChatHistoryItem, expanded: boolean, styled = false): string {
+    const arrow = expanded ? "▼" : "▶";
+    const title = this.formatTitle(item, styled);
+    const summary = item.accordionSummary ? ` · ${item.accordionSummary}` : "";
+    const renderedSummary = styled ? themeFg(this.theme, "dim", summary) : summary;
+    return `${arrow} ${title}${renderedSummary}`;
+  }
+
+  private isAccordionItem(itemIndex: number): boolean {
+    return typeof this.items[itemIndex]?.accordionSummary === "string";
+  }
+
+  private toggleSelectedAccordionItem(): boolean {
+    const lines = this.getRenderedLines(this.cachedWidth ?? 80);
+    const itemIndex = lines[this.selectedLine]?.itemIndex;
+    if (itemIndex === undefined || !this.isAccordionItem(itemIndex)) return false;
+
+    if (this.expandedAccordionItems.has(itemIndex)) {
+      this.expandedAccordionItems.delete(itemIndex);
+    } else {
+      this.expandedAccordionItems.add(itemIndex);
+    }
+
+    const width = this.cachedWidth ?? 80;
+    this.invalidate();
+    const nextLines = this.getRenderedLines(width);
+    const targetLine = this.findItemTitleLine(nextLines, itemIndex);
+    if (targetLine >= 0) {
+      this.selectedLine = targetLine;
+      this.cursorLine = targetLine;
+    } else {
+      this.clampSelection(nextLines.length);
+      this.cursorLine = this.selectedLine;
+    }
+    this.requestRender();
+    return true;
   }
 
   private modeLabel(): string {
@@ -1042,7 +1187,9 @@ class ChatHistoryNavigator {
   }
 
   private findItemTitleLine(lines: RenderedLine[], itemIndex: number): number {
-    const titleLine = lines.findIndex((line) => line.itemIndex === itemIndex && line.kind === "title");
+    const titleLine = lines.findIndex(
+      (line) => line.itemIndex === itemIndex && (line.kind === "title" || line.kind === "accordion"),
+    );
     if (titleLine >= 0) return titleLine;
 
     // Fallback: first non-separator line of the target item — never land on an
