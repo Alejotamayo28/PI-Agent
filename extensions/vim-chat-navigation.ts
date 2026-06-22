@@ -55,6 +55,7 @@ type ModeChangeHandler = (mode: VimChatMode) => void;
 type OpenChatNavigator = () => void;
 type IsIdleHandler = () => boolean;
 type YankHandler = (text: string) => void | Promise<void>;
+type ComposeSelectionPromptHandler = (text: string) => void | Promise<void>;
 
 const DEFAULT_VISIBLE_HISTORY_LINES = 20;
 const MIN_VISIBLE_HISTORY_LINES = 10;
@@ -619,6 +620,11 @@ function runClipboardCommand(command: string, args: string[], text: string): Pro
   });
 }
 
+function formatAskSelectionPrompt(text: string): string {
+  const selectedText = cleanText(text).replace(/^\n+/, "").replace(/\n+$/, "");
+  return `Explain this selected text/code:\n\n\`\`\`text\n${selectedText}\n\`\`\``;
+}
+
 async function copyText(text: string): Promise<void> {
   try {
     const clipboard = await import("@mariozechner/clipboard");
@@ -671,6 +677,7 @@ class ChatHistoryNavigator {
     private readonly theme: any,
     private readonly onClose: () => void,
     private readonly onYank: YankHandler,
+    private readonly onComposeSelectionPrompt: ComposeSelectionPromptHandler,
   ) {}
 
   handleInput(data: string): void {
@@ -709,7 +716,7 @@ class ChatHistoryNavigator {
     const selectedItem = historyLines[this.selectedLine]?.itemIndex ?? 0;
     const header = this.theme.fg("accent", ` ${this.modeLabel()} `) + this.theme.fg(
       "muted",
-      `current session transcript • j/k move • h/l message • Enter toggle tool • V line select • v char select • y yank • Esc cancel/close`,
+      `current session transcript • j/k move • h/l message • Enter toggle tool • V/v select • y yank • ? ask • Esc cancel/close`,
     );
     const position = this.theme.fg(
       "dim",
@@ -800,6 +807,10 @@ class ChatHistoryNavigator {
       void this.yankSelection();
       return;
     }
+    if (data === "?") {
+      void this.askSelection();
+      return;
+    }
 
     if (this.mode === "visualLine") {
       if (data === "j") {
@@ -877,6 +888,23 @@ class ChatHistoryNavigator {
     await this.onYank(text);
     this.mode = "normal";
     this.requestRender();
+  }
+
+  private async askSelection(): Promise<void> {
+    const text = this.getSelectedText();
+    if (!text.trim()) {
+      this.cancelVisualMode();
+      return;
+    }
+
+    try {
+      await this.onComposeSelectionPrompt(text);
+      this.mode = "normal";
+    } catch {
+      // The callback owns user-facing failure notifications.
+    } finally {
+      this.requestRender();
+    }
   }
 
   private getSelectedText(): string {
@@ -1355,6 +1383,17 @@ export default function(pi: ExtensionAPI) {
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
               ctx.ui.notify(`Yank failed: ${message}`, "warning");
+            }
+          },
+          async (text) => {
+            try {
+              ctx.ui.setEditorText(formatAskSelectionPrompt(text));
+              ctx.ui.notify("Drafted ask prompt from selection", "info");
+              done();
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              ctx.ui.notify(`Draft failed: ${message}`, "warning");
+              throw error;
             }
           },
         ),
