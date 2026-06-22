@@ -567,6 +567,44 @@ function themeFg(theme: any, color: string, text: string): string {
   }
 }
 
+interface MarkdownRenderState {
+  inCodeFence: boolean;
+  inThinkingBlock: boolean;
+}
+
+function themeFgWithFallback(theme: any, colors: string[], text: string): string {
+  for (const color of colors) {
+    const styled = themeFg(theme, color, text);
+    if (styled !== text) return styled;
+  }
+  return text;
+}
+
+function styleThinkingLine(text: string, theme: any): string {
+  return themeFgWithFallback(theme, ["thinkingText", "dim", "muted"], text);
+}
+
+function stripThinkingInlineMarkdown(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => `${String(label)} (${String(url)})`)
+    .replace(/`([^`]*)`/g, (_match, value) => String(value))
+    .replace(/\*\*([^*]+)\*\*/g, (_match, value) => String(value));
+}
+
+function formatThinkingMarkdownLine(text: string): string {
+  const trimmed = text.trimStart();
+  const leading = text.slice(0, text.length - trimmed.length);
+
+  if (/^#{1,6}\s+/.test(trimmed)) return leading + stripThinkingInlineMarkdown(trimmed.replace(/^#{1,6}\s+/, ""));
+  if (/^>\s?/.test(trimmed)) return leading + stripThinkingInlineMarkdown(trimmed.replace(/^>\s?/, ""));
+  if (/^([-*+] |\d+\.\s+)/.test(trimmed)) {
+    const marker = trimmed.match(/^([-*+] |\d+\.\s+)/)?.[0] ?? "";
+    return leading + marker + stripThinkingInlineMarkdown(trimmed.slice(marker.length));
+  }
+
+  return leading + stripThinkingInlineMarkdown(trimmed);
+}
+
 function styleInlineMarkdown(text: string, theme: any): string {
   const segments = text.split(/(`[^`]*`)/g);
   return segments.map((segment) => {
@@ -582,9 +620,24 @@ function styleInlineMarkdown(text: string, theme: any): string {
   }).join("");
 }
 
-function styleMarkdownLine(text: string, theme: any, state: { inCodeFence: boolean }): string {
+function styleMarkdownLine(text: string, theme: any, state: MarkdownRenderState): string {
   const trimmed = text.trimStart();
   const leading = text.slice(0, text.length - trimmed.length);
+
+  if (!state.inCodeFence && trimmed.trim() === "[thinking]") {
+    state.inThinkingBlock = true;
+    return styleThinkingLine(text, theme);
+  }
+
+  if (state.inThinkingBlock) {
+    if (/^```/.test(trimmed)) {
+      state.inCodeFence = !state.inCodeFence;
+      return styleThinkingLine(text, theme);
+    }
+
+    if (state.inCodeFence || !trimmed.trim()) return styleThinkingLine(text, theme);
+    return styleThinkingLine(formatThinkingMarkdownLine(text), theme);
+  }
 
   if (/^```/.test(trimmed)) {
     const styled = themeFg(theme, "mdCodeBlockBorder", text);
@@ -937,7 +990,7 @@ class ChatHistoryNavigator {
     const lines: RenderedLine[] = [];
     const appendBodyLines = (item: ChatHistoryItem, itemIndex: number) => {
       const bodyWidth = Math.max(1, width - 2);
-      const markdownState = { inCodeFence: false };
+      const markdownState: MarkdownRenderState = { inCodeFence: false, inThinkingBlock: false };
       for (const sourceLine of cleanText(item.body).split("\n")) {
         for (const bodyLine of wrapPlainLine(sourceLine || " ", bodyWidth)) {
           const rawText = `  ${bodyLine}`;
