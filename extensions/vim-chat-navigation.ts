@@ -995,6 +995,21 @@ class ChatHistoryNavigator {
     return typeof this.items[itemIndex]?.accordionSummary === "string";
   }
 
+  private shouldSkipGroupNavigationItem(itemIndex: number): boolean {
+    const role = this.items[itemIndex]?.role;
+    return role === "toolResult" || role === "bashExecution";
+  }
+
+  private findGroupNavigationTargetItem(currentItem: number, delta: number): number | undefined {
+    if (this.items.length === 0 || delta === 0) return undefined;
+
+    for (let itemIndex = currentItem + delta; itemIndex >= 0 && itemIndex < this.items.length; itemIndex += delta) {
+      if (!this.shouldSkipGroupNavigationItem(itemIndex)) return itemIndex;
+    }
+
+    return undefined;
+  }
+
   private toggleSelectedAccordionItem(): boolean {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const itemIndex = lines[this.selectedLine]?.itemIndex;
@@ -1042,11 +1057,13 @@ class ChatHistoryNavigator {
   private moveGroup(delta: number): void {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const currentItem = lines[this.selectedLine]?.itemIndex ?? 0;
-    const targetItem = Math.max(0, Math.min(this.items.length - 1, currentItem + delta));
-    const targetLine = this.findItemTitleLine(lines, targetItem);
-    if (targetLine >= 0) {
-      this.selectedLine = targetLine;
-      this.cursorLine = this.selectedLine;
+    const targetItem = this.findGroupNavigationTargetItem(currentItem, delta);
+    if (targetItem !== undefined) {
+      const targetLine = this.findItemTitleLine(lines, targetItem);
+      if (targetLine >= 0) {
+        this.selectedLine = targetLine;
+        this.cursorLine = this.selectedLine;
+      }
     }
     this.requestRender();
   }
@@ -1061,11 +1078,13 @@ class ChatHistoryNavigator {
   private moveVisualGroup(delta: number): void {
     const lines = this.getRenderedLines(this.cachedWidth ?? 80);
     const currentItem = lines[this.selectedLine]?.itemIndex ?? 0;
-    const targetItem = Math.max(0, Math.min(this.items.length - 1, currentItem + delta));
-    const targetLine = this.findItemTitleLine(lines, targetItem);
-    if (targetLine >= 0) {
-      this.selectedLine = targetLine;
-      this.cursorLine = this.selectedLine;
+    const targetItem = this.findGroupNavigationTargetItem(currentItem, delta);
+    if (targetItem !== undefined) {
+      const targetLine = this.findItemTitleLine(lines, targetItem);
+      if (targetLine >= 0) {
+        this.selectedLine = targetLine;
+        this.cursorLine = this.selectedLine;
+      }
     }
     this.requestRender();
   }
