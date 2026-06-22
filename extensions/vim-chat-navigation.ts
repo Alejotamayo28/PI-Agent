@@ -16,6 +16,7 @@ type VimChatMode = "insert" | "chat";
 type MessageRole = "user" | "assistant" | "toolResult" | "bashExecution" | "custom" | "branchSummary" | "compactionSummary" | "entry";
 type NavigatorMode = "normal" | "visualLine" | "visualChar";
 type RenderedLineKind = "separator" | "title" | "body";
+type SectionSeparatorLabel = "PROMPT" | "AGENT RESULT";
 
 interface ChatHistoryItem {
   role: MessageRole;
@@ -40,6 +41,7 @@ interface RenderedLine {
   rawText: string;
   displayText?: string;
   kind: RenderedLineKind;
+  separatorLabel?: SectionSeparatorLabel;
 }
 
 interface TextRange {
@@ -408,6 +410,15 @@ function getChatHistoryItems(branchEntries: readonly unknown[]): ChatHistoryItem
     .filter((item): item is ChatHistoryItem => Boolean(item));
 }
 
+function getSectionSeparatorLabel(
+  item: ChatHistoryItem,
+  previousItem: ChatHistoryItem | undefined,
+): SectionSeparatorLabel | undefined {
+  if (item.role === "user") return "PROMPT";
+  if (!previousItem || previousItem.role === "user") return "AGENT RESULT";
+  return undefined;
+}
+
 function wrapPlainLine(text: string, width: number): string[] {
   if (width <= 0) return [""];
   if (visibleWidth(text) <= width) return [text];
@@ -634,10 +645,11 @@ class ChatHistoryNavigator {
         }
 
         if (line.kind === "separator") {
-          const inVisualLineRange = this.mode === "visualLine" && this.isLineInVisualLineRange(globalIndex);
-          const separator = this.theme.fg("borderMuted", "─".repeat(Math.max(0, safeWidth - 2)));
+          const shouldHighlight = (this.mode === "normal" && globalIndex === this.selectedLine)
+            || (this.mode === "visualLine" && this.isLineInVisualLineRange(globalIndex));
+          const separator = this.theme.fg("borderMuted", this.formatSeparator(line.separatorLabel, safeWidth));
           lines.push(
-            this.padLine(inVisualLineRange ? this.theme.bg("selectedBg", separator) : separator, safeWidth),
+            this.padLine(shouldHighlight ? this.theme.bg("selectedBg", separator) : separator, safeWidth),
           );
           continue;
         }
@@ -805,7 +817,11 @@ class ChatHistoryNavigator {
 
     const lines: RenderedLine[] = [];
     this.items.forEach((item, itemIndex) => {
-      lines.push({ itemIndex, rawText: "", kind: "separator" });
+      const separatorLabel = getSectionSeparatorLabel(item, this.items[itemIndex - 1]);
+      if (separatorLabel) {
+        lines.push({ itemIndex, rawText: "", kind: "separator", separatorLabel });
+      }
+
       lines.push({
         itemIndex,
         rawText: this.formatTitle(item),
@@ -1045,6 +1061,20 @@ class ChatHistoryNavigator {
 
   private clampColumn(lineIndex: number, column: number): number {
     return clamp(column, 0, this.maxColumnForLine(lineIndex));
+  }
+
+  private formatSeparator(label: SectionSeparatorLabel | undefined, width: number): string {
+    const innerWidth = Math.max(0, width - 2);
+    if (!label) return "─".repeat(innerWidth);
+
+    const labelText = ` ${label} `;
+    const labelWidth = visibleWidth(labelText);
+    if (labelWidth >= innerWidth) return truncateToWidth(label.trim(), innerWidth, "");
+
+    const remaining = innerWidth - labelWidth;
+    const leftWidth = Math.floor(remaining / 2);
+    const rightWidth = remaining - leftWidth;
+    return `${"─".repeat(leftWidth)}${labelText}${"─".repeat(rightWidth)}`;
   }
 
   private border(width: number, position: "top" | "middle" | "bottom"): string {
