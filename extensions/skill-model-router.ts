@@ -15,12 +15,12 @@ interface SkillModelTarget {
 
 const skillModels: Record<string, SkillModelTarget> = {
   "default-model": {
-    provider: "openai-codex",
-    model: "gpt-5.5",
+    provider: "opencode-go",
+    model: "minimax-m3",
   },
   "commit-name": {
-    provider: "openai-codex",
-    model: "gpt-5.4-mini",
+    provider: "opencode-go",
+    model: "minimax-m3",
   },
 };
 
