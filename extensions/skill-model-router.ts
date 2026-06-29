@@ -20,7 +20,7 @@ const skillModels: Record<string, SkillModelTarget> = {
   },
   "commit-name": {
     provider: "opencode-go",
-    model: "minimax-m3",
+    model: "deepseek-v4-flash",
   },
 };
 

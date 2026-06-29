@@ -11,10 +11,10 @@
   ],
   "defaultProvider": "opencode-go",
   "defaultModel": "minimax-m3",
-  "hideThinkingBlock": false,
+  "hideThinkingBlock": true,
   "defaultThinkingLevel": "high",
   "subagents": {
-    "autoRun": false
+    "autoRun": true
   },
   "theme": "ristretto",
   "terminal": {
